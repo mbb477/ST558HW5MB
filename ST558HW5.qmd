@@ -5,23 +5,477 @@ format: html
 editor: visual
 ---
 
-## Quarto
+# Task 1. Conceptual Questions
 
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+1.  What is the purpose of using cross-validation when fitting a random forest model?
 
-## Running Code
+    > The purpose of cross validation is to help identify the optimal the number of variables/predictors to use for each split.
 
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+2.  Describe the bagged tree algorithm.
+
+    > The bagged tree algorithm uses one set of data/sample and treats it as a population. Samples (called bootstrap samples, resampling done with replacement) are taken from the data and a tree constructed for each bootstrap sample. If the method is for regression trees, the resulting predictions averaged. For classification trees, often majority vote is used to determine the final classification prediction.
+
+3.  What is meant by a general linear model?
+
+    > The term general linear model typically refers to linear regression, where the response is continuous and both continuous and categorical predictors can be included.
+
+4.  When fitting a multiple linear regression model, what does adding an interaction term do? That is, what does it allow the model to do differently as compared to when it is not included in the model?
+
+    > Interaction terms allow the effect of one predictor on the response variable to be dependent on the effect of another predictor. This affects the resulting coefficients in the model and our interpretation of them. In MLR without interactions, the best plane is being fit to the data. In MLR with interactions, the best saddle through the points is being fit.
+
+5.  Why do we split our data into a training and test set?
+
+    > The training set is used to train the model we are interested in. The test set is used to test the prediction accuracy of the model. By having separate sets for training and testing, the resulting predictions are less biased and more accurate representations of the model since the test data is unseen during the training process.
+
+# Task 2. Fitting Models
+
+The first step is to read in the data. Since it is a csv file, we can use read_csv() from tidyverse. Packages used throughout this document will also be loaded in this step.
 
 ```{r}
-1 + 1
+#| warning: false
+#| message: false
+library(tidyverse)
+library(psych)
+library(caret)
+heart_data <- read_csv("heart.csv")
+heart_data
+
 ```
 
-You can add options to executable code like this
+## Quick EDA/Data Preparation
+
+### 1. Understand the data.
+
+The first step is to understand the data by checking missingness and summarize the data. First, missingness will be checked using is.na(). This check shows that there is no missing data in terms of NA values.
 
 ```{r}
-#| echo: false
-2 * 2
+colSums(is.na(heart_data))
+
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+Next, we can summarize the data. The simplest method is to use describe() from the psych package.
+
+```{r}
+describe(heart_data)
+
+```
+
+In looking at the summary statistics above, we can see that the minimum value for RestingBP and cholesterol is zero. Using filter(), we can see that 172 of 918 observations have Cholesterol or RestingBP measurements with inappropriate values of zero that could bias the data.
+
+```{r}
+heart_data |>  filter(RestingBP == 0 | Cholesterol == 0)
+
+```
+
+A new data set will be created below removing observations for purposes of determining the relationship between the numeric variables in the data and the HeartDisease variable.
+
+```{r}
+heart_data_d <- heart_data |>
+  filter(Cholesterol !=0 & RestingBP != 0)
+heart_data_d
+```
+
+To understand the relationship between the categorical variables and HeartDisease variable, we can look at contingency tables. In looking at the contingency table for Sex and HeartDisease, we can see that a greater proportion of men had heart disease compared to women. This indicates that Sex may be an important predictor for heart disease.
+
+```{r}
+heart_data |>
+  group_by(Sex, HeartDisease) |>
+  summarize(count = n()) |>
+  pivot_wider(names_from = HeartDisease, values_from = count)
+
+```
+
+In looking at ChestPainType, a larger proportion of individuals who had heart disease were categorized as ASY for chest pain (79%), which is the asymptomatic category, compared to other categories.
+
+```{r}
+heart_data |>
+  group_by(ChestPainType, HeartDisease) |>
+  summarize(count = n(), .groups = "drop") |>
+  pivot_wider(names_from = HeartDisease, values_from = count)
+
+```
+
+For ExerciseAngina, more than 80% of individuals who reported exercise angina had heart disease compared to 25.9% of those with no exercise angina.
+
+```{r}
+heart_data |>
+  group_by(ExerciseAngina, HeartDisease) |>
+  summarize(count = n(), .groups = "drop") |>
+  pivot_wider(names_from = HeartDisease, values_from = count)
+
+
+```
+
+The contingency table for RestingECG and HeartDisease is below. Resting electrocardiogram results ranged from 42-58% for those with heart disease.
+
+```{r}
+heart_data |>
+  group_by(RestingECG, HeartDisease) |>
+  summarize(count = n(), .groups = "drop") |>
+  pivot_wider(names_from = HeartDisease, values_from = count)
+
+
+```
+
+For the numeric variables, we can look at correlation of the independent variables with the HeartDisease variable. Correlations were determined using the data with the Cholesterol and RestingBP values of 0 dropped. The correlations shown below indicate that none of the numeric variables has a particularly strong relationship with the HeartDisease variable. The Cholesterol variable has a correlation of 0.104. Given the weak correlation and the number of zeros included for the Cholesterol data, I am going to remove this variable from the data.
+
+```{r}
+vars <- c("RestingBP", "Age", "Cholesterol", "MaxHR", "Oldpeak")
+corr_values <- sapply(heart_data_d[vars], 
+                      function(x) cor(x, heart_data_d$HeartDisease))
+corr_values
+
+```
+
+### 2. Remove ST_Slope variable and create factor version of HeartDisease
+
+As discussed previously, the one errant observation with a 0 recorded for RestingBP will be dropped here. The Cholesterol column is also going to be dropped since it has a low linear correlation with the HeartDisease variable and has 171 zeros recorded. These omissions will be done in this data step of removing the ST_Slope variable and converting HeartDisease to a factor.
+
+```{r}
+heart_data <- heart_data |>
+  filter(RestingBP != 0) |>
+  select(-ST_Slope, -Cholesterol) |>
+  mutate(HeartDisease = as.factor(HeartDisease))
+heart_data
+
+```
+
+### 3. Create dummy columns for Sex, ExerciseAngina, ChestPainType and RestingECG for KNN analysis
+
+To create dummy columns for Sex, ExerciseAngina, ChestPainType and RestingECG, these variables need to be in factor form.
+
+```{r}
+heart_dataKNN <- heart_data |>
+  mutate(Sex = as.factor(Sex),
+         ExerciseAngina = as.factor(ExerciseAngina),
+         ChestPainType = as.factor(ChestPainType),
+         RestingECG = as.factor(RestingECG))
+heart_dataKNN
+
+
+```
+
+The dummyVars() function from the caret package will be used to create our dummy columns. This function adds new columns for each level of the variable.
+
+```{r}
+dummy_vars <- dummyVars(~ ChestPainType + RestingECG + Sex + ExerciseAngina, 
+                        data = heart_dataKNN)
+#dummy_vars
+dummies <- predict(dummy_vars, newdata = heart_dataKNN)
+#dummies
+heart_dataKNN <- heart_dataKNN |>
+  select(-ChestPainType, -RestingECG, -Sex, -ExerciseAngina) |>
+  bind_cols(dummies)
+heart_dataKNN
+
+```
+
+## Split the data
+
+Now that the data has been manipulated as necessary, we want to split it into training and test sets. This can be done using createDataPartition() from the caret package. The training set will be set to include 80% of the data and the test set 20%.
+
+```{r}
+set.seed(100)
+trainIndex <- createDataPartition(heart_dataKNN$HeartDisease, 
+                                  p = 0.8, 
+                                  list = FALSE)
+heartTrain <- heart_dataKNN[trainIndex, ]
+heartTest <- heart_dataKNN[-trainIndex, ]
+#heartTrain
+#heartTest
+
+```
+
+## KNN
+
+Before KNN can be performed, the test and train sets should be pre-processed by centering and scaling. This is done using preProcess() from caret and specifying center and scale in the method.
+
+```{r}
+preProcValues <- preProcess(heartTrain, method = c("center", "scale"))
+heartTrainTransformed <- predict(preProcValues, heartTrain)
+heartTestTransformed <- predict(preProcValues, heartTest)
+heartTrainTransformed
+heartTestTransformed
+
+```
+
+Now that the data is standardized, we can proceed with the KNN analysis. Since we want to use cross validation with repeats, we use the method repeatedcv. The number option is for the number of cross validation folds, which is input as 10. Lastly, we want to set the number of repeats, which is set at 3. For the KNN fit, we need to specify the tuneGrid, which for KNN are the options for k, put in a data frame. A k of 1-40 was selected.
+
+```{r}
+heartTrainControl <- trainControl(method = "repeatedcv", number = 10, 
+                                  repeats = 3)
+set.seed(100)
+knnFit <- train(HeartDisease ~ ., data = heartTrainTransformed, method = "knn",
+                trControl = heartTrainControl, tuneGrid = data.frame(k = 1:40))
+knnFit$results
+knnFit$bestTune
+
+```
+
+The best tune was for k=9, with an accuracy of 82.42 %. Next, we can check how well the model performs on our test set by obtaining a confusion matrix using confusionMatrix(). Looking at the output below, the prediction accuracy on our test set is 81.97%, which isn't that different from the training accuracy of 82.66%. Note that when KNN was performed with the Cholesterol variable (zeros dropped), the accuracy on the trained data was 82.66% and the accuracy on the test set was 80.87%.
+
+```{r}
+confusionMatrix(data = heartTestTransformed$HeartDisease, 
+                reference = predict(knnFit, newdata = heartTestTransformed))
+
+```
+
+## Logistic Regression
+
+For logistic regression classification, I'd suggest the following 3 models.
+
+1.  Full data set minus cholesterol variable for reasons stated previously
+2.  Full data set minus Cholesterol and RestingBP since they have the lowest correlations with HeartDisease
+3.  Full data set minus Cholesterol, RestingBP and Resting ECG. RestingECG will be removed since the differences in RestingECG for those with and without heart disease don't appear drastically different based on the contingency table. Obviously correlation data would be more accurate to look at to determine the validity of dropping this variable.
+
+For the first model, we can use the heart_data created in the Quick EDQ/Data Preparation section. This data set maintains the original categorical variables before adding dummy columns for KNN analysis. New training and test sets are created below.
+
+```{r}
+set.seed(100)
+trainIndex <- createDataPartition(heart_data$HeartDisease, 
+                                  p = 0.8, 
+                                  list = FALSE)
+heartTrain <- heart_data[trainIndex, ]
+heartTest <- heart_data[-trainIndex, ]
+
+```
+
+Next, the data will be centered and scaled.
+
+```{r}
+preProcValues <- preProcess(heartTrain, method = c("center", "scale"))
+heartTrainTransformed <- predict(preProcValues, heartTrain)
+heartTestTransformed <- predict(preProcValues, heartTest)
+heartTrainTransformed
+heartTestTransformed
+
+
+```
+
+Finally, the model will be run using the caret package, with the same specifications as for KNN, with the exception of a tuning parameter. Here, we use the method "glm" and specify "binomial" for family since we have a binary response for heart disease.
+
+```{r}
+heartTrainControl1 <- trainControl(method = "repeatedcv", number = 10, 
+                                  repeats = 3)
+set.seed(100)
+glmFit1 <- train(HeartDisease ~ ., data = heartTrainTransformed, method = "glm",
+                trControl = heartTrainControl1, family = "binomial")
+glmFit1$results
+
+```
+
+The first model has a prediction accuracy of 81.42%. For the second model, RestingBP will be dropped from the transformed data.
+
+```{r}
+heartTrainTransformed2 <- heartTrainTransformed |>
+  select(-RestingBP)
+heartTestTransformed2 <- heartTestTransformed |>
+  select(-RestingBP)
+
+```
+
+Now the model 2 can be fit as seen below. In looking at the fit results, we can see that dropping the RestingBP variable did not improve the accuracy, which now sits slightly lower at 81.38%
+
+```{r}
+heartTrainControl2 <- trainControl(method = "repeatedcv", number = 10, 
+                                  repeats = 3)
+set.seed(100)
+glmFit2 <- train(HeartDisease ~ ., data = heartTrainTransformed2, method = "glm",
+                trControl = heartTrainControl2, family = "binomial")
+glmFit2$results
+
+
+```
+
+For model 3, the RestingECG variable was removed from the transformed train and test sets and the model rerun. This model has an accuracy of 81.15%, which is lower than the previous two models.
+
+```{r}
+heartTrainTransformed3 <- heartTrainTransformed2 |>
+  select(-RestingECG)
+heartTestTransformed3 <- heartTestTransformed2 |>
+  select(-RestingECG)
+heartTrainControl3 <- trainControl(method = "repeatedcv", number = 10, 
+                                  repeats = 3)
+set.seed(100)
+glmFit3 <- train(HeartDisease ~ ., data = heartTrainTransformed3, method = "glm",
+                trControl = heartTrainControl3, family = "binomial")
+glmFit3$results
+
+
+```
+
+Out of all 3 models, the first one with the Cholesterol variable removed is the most accurate, with an accuracy rate of 81.42%. Accuracy on the test set is shown below using confusionMatrix(). The accuracy on the test data set is 81.97%. Interestingly, this exactly the same as the accuracy for the KNN model presented previously.
+
+```{r}
+confusionMatrix(data = heartTestTransformed$HeartDisease, 
+                reference = predict(glmFit1, newdata = heartTestTransformed))
+
+```
+
+## Tree Models
+
+Now, we want to fit the data from the 3 posited models in the logistic regression section to various types of tree models. Since the same 3 models used in logistic regression will be used here, the same training and test sets from the logistic regression section will be used here.
+
+### Classification Tree
+
+The code and output for model 1 where the Cholesterol variable is removed is presented below. Since this is model 1, we will use heartTrainControl1 from the logistic regression section, which used repeatedcv, 10 folds and 3 repeats. The best model for model 1 is the one with a complexity parameter of 0.004, with an accuracy of 79.65%.
+
+```{r}
+set.seed(100)
+treeFit1 <- train(HeartDisease ~ ., data = heartTrainTransformed, 
+                  method = "rpart",
+                  trControl = heartTrainControl1, 
+                  tuneGrid = expand.grid(cp = seq(0, 0.1, 0.001)))
+treeFit1$results
+treeFit1$bestTune
+
+```
+
+Now the same steps will be performed for model 2. The best model here is the one with a cp of 0.003m which has an accuracy of 80.20%.
+
+```{r}
+set.seed(100)
+treeFit2 <- train(HeartDisease ~ ., data = heartTrainTransformed2, 
+                  method = "rpart",
+                  trControl = heartTrainControl, 
+                  tuneGrid = expand.grid(cp = seq(0, 0.1, 0.001)))
+treeFit2$results
+treeFit2$bestTune
+
+
+```
+
+Next is model 3, which excludes Cholesterol, RestingBP and RestingECG variables from the data. The model with the best fit had a cp of 0.003 and an accuracy of 79.97%.
+
+```{r}
+set.seed(100)
+treeFit2 <- train(HeartDisease ~ ., data = heartTrainTransformed2, 
+                  method = "rpart",
+                  trControl = heartTrainControl2, 
+                  tuneGrid = expand.grid(cp = seq(0, 0.1, 0.001)))
+treeFit2$results
+treeFit2$bestTune
+
+
+```
+
+Of the 3 models, model 2 had the best accuracy at 80.20%. The confusion matrix output is presented below. The accuracy using test data is 83.61%.
+
+```{r}
+confusionMatrix(data = heartTestTransformed2$HeartDisease, 
+                reference = predict(treeFit2, newdata = heartTestTransformed2))
+
+```
+
+### Random Forest
+
+The code and output for model 1 where the Cholesterol variable is removed is presented below. Since this is model 1, we will use heartTrainControl1 from the previous two sections, which used repeatedcv (cross validation), 10 folds and 3 repeats. Since this is for a random forest, we use "rf" for method. The tuning parameter is mtry, which specifies the number of predictors in the data to be randomly sampled at each split. For model 1, we have 10 predictors, so mtry is a data frame of 1:10. The best model for model 1 is the one with an mtry of 2 variables, with an accuracy of 82.52%.
+
+```{r}
+set.seed(100)
+rfFit1 <- train(HeartDisease ~ ., data = heartTrainTransformed, 
+                  method = "rf",
+                  trControl = heartTrainControl1, 
+                  tuneGrid = data.frame(mtry = 1:10))
+rfFit1$results
+rfFit1$bestTune
+
+```
+
+The fit for model 2, with mtry of 9, since we are dropping the RestingBP variable for this model, is presented below. A mtry of 2 was also selected for this model, with an accuracy of 82.06%.
+
+```{r}
+set.seed(100)
+rfFit2 <- train(HeartDisease ~ ., data = heartTrainTransformed2, 
+                  method = "rf",
+                  trControl = heartTrainControl2, 
+                  tuneGrid = data.frame(mtry = 1:9))
+rfFit2$results
+rfFit2$bestTune
+
+
+```
+
+The fit for model 3, with mtry of 8, since we are dropping the RestingECG variable for this model, is presented below. The model with an mtry of 1 gave the highest accuracy, which as 82.02%.
+
+```{r}
+set.seed(100)
+rfFit3 <- train(HeartDisease ~ ., data = heartTrainTransformed3, 
+                  method = "rf",
+                  trControl = heartTrainControl3, 
+                  tuneGrid = data.frame(mtry = 1:8))
+rfFit3$results
+rfFit3$bestTune
+
+
+```
+
+Of the 3 random forest models above, the first model with all predictors except Cholesterol performed the best. The confusion matrix output is presented below for this model. The performance on the test data set was 83.61% accuracy.
+
+```{r}
+confusionMatrix(data = heartTestTransformed$HeartDisease, 
+                reference = predict(rfFit1, newdata = heartTestTransformed))
+
+
+```
+
+### Boosted Tree
+
+The same transformed sets used in the previous sections will be used here. For boosted trees, we will use gbm for the method. Since we want to test variations of tuning parameters, a grid with these parameters will be created using expand.grid and this data frame will then be used in tuneGrid. The best model used n.trees of 25 and an interaction depth of 3. The accuracy of this model is 82.33%.
+
+```{r}
+grid <- expand.grid(n.trees = c(25,50, 100, 200), 
+                    interaction.depth = c(1:3), 
+                    shrinkage = c(0.1), 
+                    n.minobsinnode = c(10))
+set.seed(100)
+boostFit1 <- train(HeartDisease ~ ., data = heartTrainTransformed, 
+                  method = "gbm",
+                  trControl = heartTrainControl1, 
+                  tuneGrid = grid, verbose = FALSE)
+boostFit1$results
+boostFit1$bestTune
+
+
+```
+
+The output for model 2 is presented below. The optimal settings were for 100 trees and an interaction depth of 2. The accuracy of this model is 82.47%.
+
+```{r}
+set.seed(100)
+boostFit2 <- train(HeartDisease ~ ., data = heartTrainTransformed2, 
+                  method = "gbm",
+                  trControl = heartTrainControl2, 
+                  tuneGrid = grid, verbose = FALSE)
+boostFit2$results
+boostFit2$bestTune
+
+
+```
+
+The output for model 3 is presented below. The optimal settings were for 100 trees and an interaction depth of 2. The accuracy of this model is 82.56%.
+
+```{r}
+set.seed(100)
+boostFit3 <- train(HeartDisease ~ ., data = heartTrainTransformed3, 
+                  method = "gbm",
+                  trControl = heartTrainControl3, 
+                  tuneGrid = grid, verbose = FALSE)
+boostFit3$results
+boostFit3$bestTune
+
+
+```
+
+Of the 3 models, model 3 gave the best accuracy. The confusion matrix is below. The accuracy on the test data is 83.06%.
+
+```{r}
+confusionMatrix(data = heartTestTransformed3$HeartDisease, 
+                reference = predict(boostFit3, newdata = heartTestTransformed3))
+
+
+```
+
+## Wrap Up
+
+KNN and the best performing logistic regression model both had an accuracy of 81.97% on the test data. Similarly, the best classification tree and random forest model had an accuracy of 83.61% on the test data. Lastly, the boosted tree had an accuracy of 83.06% for the test data. In conclusion, there was a tie between the classification tree and random forest models for best performer, with both having an accuracy of 83.61% on the test set. However, the random forest model with the best accuracy used 10 variables while the classification model used 9. Since we usually want to use the most parsimonious model, the classification model may be the better option of the two.
